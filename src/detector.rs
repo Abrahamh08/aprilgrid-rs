@@ -7,9 +7,8 @@ use std::{
 
 use crate::image_util::GrayImagef32;
 use crate::saddle::Saddle;
-use crate::{image_util, math_util, tag_families};
-use faer::prelude::SpSolverLstsq;
-use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma};
+use crate::{image_util, tag_families};
+use image::{DynamicImage, GrayImage, ImageBuffer, Luma};
 use itertools::Itertools;
 use kiddo::{KdTree, SquaredEuclidean};
 
@@ -187,137 +186,182 @@ pub struct Tag {
     pub p: [(f32, f32); 4],
 }
 
+/// Cubic interpolation using Catmull–Rom.
+/// Given four values (v0, v1, v2, v3) and a parameter t in [0, 1],
+/// returns the interpolated value.
+fn cubic_interp(v0: f32, v1: f32, v2: f32, v3: f32, t: f32) -> f32 {
+    let a = -0.5 * v0 + 1.5 * v1 - 1.5 * v2 + 0.5 * v3;
+    let b = v0 - 2.5 * v1 + 2.0 * v2 - 0.5 * v3;
+    let c = -0.5 * v0 + 0.5 * v2;
+    let d = v1;
+    a * t * t * t + b * t * t + c * t + d
+}
+
+/// Bicubic interpolation sample function.
+/// Uses a 4×4 neighborhood around (x, y) (in f32 coordinates)
+/// and falls back to bilinear interpolation if too close to the border.
+fn bicubic_sample<T>(
+    image: &ImageBuffer<Luma<T>, Vec<T>>,
+    x: f32,
+    y: f32,
+) -> f32
+where
+    T: image::Primitive + Into<f32> + Copy,
+{
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+
+    let x_int = x.floor() as i32;
+    let y_int = y.floor() as i32;
+    let t = x - x.floor();
+    let u = y - y.floor();
+
+    // Fall back to bilinear interpolation if too near the border.
+    if x_int < 1 || y_int < 1 || x_int >= width - 2 || y_int >= height - 2 {
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let x1 = x0 + 1;
+        let y1 = y0 + 1;
+        if x0 < 0 || y0 < 0 || x1 >= width || y1 >= height {
+            return 0.0;
+        }
+        let dx = x - x0 as f32;
+        let dy = y - y0 as f32;
+        let p00: f32 = image.get_pixel(x0 as u32, y0 as u32).0[0].into();
+        let p10: f32 = image.get_pixel(x1 as u32, y0 as u32).0[0].into();
+        let p01: f32 = image.get_pixel(x0 as u32, y1 as u32).0[0].into();
+        let p11: f32 = image.get_pixel(x1 as u32, y1 as u32).0[0].into();
+        return (1.0 - dx) * (1.0 - dy) * p00 +
+               dx * (1.0 - dy) * p10 +
+               (1.0 - dx) * dy * p01 +
+               dx * dy * p11;
+    }
+
+    let mut arr = [0.0_f32; 4];
+    for m in -1..=2 {
+        let mut col = [0.0_f32; 4];
+        for n in -1..=2 {
+            let sample_x = (x_int + n) as u32;
+            let sample_y = (y_int + m) as u32;
+            col[(n + 1) as usize] = image.get_pixel(sample_x, sample_y).0[0].into();
+        }
+        arr[(m + 1) as usize] = cubic_interp(col[0], col[1], col[2], col[3], t);
+    }
+    // Interpolate the four intermediate values along y.
+    cubic_interp(arr[0], arr[1], arr[2], arr[3], u)
+}
+
+/// Computes the gradient (gx, gy) and Hessian (fxx, fyy, fxy) at (x, y)
+/// using central differences with a small step size.
+fn compute_gradient_hessian<T>(
+    image: &ImageBuffer<Luma<T>, Vec<T>>,
+    x: f32,
+    y: f32,
+) -> (f32, f32, f32, f32, f32)
+where
+    T: image::Primitive + Into<f32> + Copy,
+{
+    let h = 1e-1_f32;
+    let f_center = bicubic_sample(image, x, y);
+    let f_x_plus = bicubic_sample(image, x + h, y);
+    let f_x_minus = bicubic_sample(image, x - h, y);
+    let f_y_plus = bicubic_sample(image, x, y + h);
+    let f_y_minus = bicubic_sample(image, x, y - h);
+    let f_xy_pp = bicubic_sample(image, x + h, y + h);
+    let f_xy_pm = bicubic_sample(image, x + h, y - h);
+    let f_xy_mp = bicubic_sample(image, x - h, y + h);
+    let f_xy_mm = bicubic_sample(image, x - h, y - h);
+
+    let gx = (f_x_plus - f_x_minus) / (2.0 * h);
+    let gy = (f_y_plus - f_y_minus) / (2.0 * h);
+    let fxx = (f_x_plus - 2.0 * f_center + f_x_minus) / (h * h);
+    let fyy = (f_y_plus - 2.0 * f_center + f_y_minus) / (h * h);
+    let fxy = (f_xy_pp - f_xy_pm - f_xy_mp + f_xy_mm) / (4.0 * h * h);
+    (gx, gy, fxx, fyy, fxy)
+}
+
+/// Refines initial corner points using Newton–Raphson iteration.
+/// The initial corners (in f32) are assumed to be at the top–left of a pixel;
+/// they are shifted to the pixel center (by adding 0.5) before refinement.
+/// Returns a vector of refined Saddle points.
 pub fn rochade_refine<T>(
     image_input: &ImageBuffer<Luma<T>, Vec<T>>,
     initial_corners: &Vec<(f32, f32)>,
-    half_size_patch: i32,
 ) -> Vec<Saddle>
 where
-    T: image::Primitive + Into<f32>,
+    T: image::Primitive + Into<f32> + Copy,
 {
-    const PIXEL_MOVE_THRESHOLD: f32 = 1.0;
-    let mut refined_corners = Vec::<Saddle>::new();
-    // kernel
-    let kernel_size = (half_size_patch * 2 + 1) as usize;
-    let gamma = half_size_patch as f32;
-    let flat_k_slice: Vec<f32> = (0..kernel_size)
-        .flat_map(|i| {
-            (0..kernel_size)
-                .map(move |j| {
-                    0.0_f32.max(
-                        gamma + 1.0
-                            - ((gamma - i as f32) * (gamma - i as f32)
-                                + (gamma - j as f32) * (gamma - j as f32))
-                                .sqrt(),
-                    )
-                })
-                .collect::<Vec<f32>>()
-        })
-        .collect();
-    let s = flat_k_slice.iter().sum::<f32>();
-    let flat_k: Vec<f32> = flat_k_slice.iter().map(|v| v / s).collect();
+    const PIXEL_MOVE_THRESHOLD: f32 = 0.0001;
+    const MAX_ITER: usize = 10000;
+    let mut refined_corners = Vec::new();
 
-    let (width, height) = (image_input.width() as i32, image_input.height() as i32);
-    let half_size_patch2 = half_size_patch * 2;
+    let width = image_input.width() as f32;
+    let height = image_input.height() as f32;
 
-    // iter all corner
-    for &(initial_x, initial_y) in initial_corners {
-        let round_x = initial_x.round() as i32;
-        let round_y = initial_y.round() as i32;
-        if (round_y - half_size_patch2) < 0
-            || (round_y + half_size_patch2 >= height)
-            || (round_x - half_size_patch2 < 0)
-            || (round_x + half_size_patch2 >= width)
-        {
+    for &(init_x, init_y) in initial_corners {
+        // Start at the center of the pixel.
+        let mut x = init_x + 0.5;
+        let mut y = init_y + 0.5;
+        let mut iter = 0;
+
+        loop {
+            iter += 1;
+            if iter > MAX_ITER {
+                break;
+            }
+            // Ensure we are within safe bounds for bicubic sampling.
+            if x < 1.0 || y < 1.0 || x > width - 3.0 || y > height - 3.0 {
+                break;
+            }
+
+            let (gx, gy, fxx, fyy, fxy) = compute_gradient_hessian(image_input, x, y);
+            let det = fxx * fyy - fxy * fxy;
+            if det.abs() < 1e-12 {
+                break;
+            }
+            // Newton–Raphson update: Δ = -H⁻¹ ∇f.
+            let delta_x = -(fyy * gx - fxy * gy) / det;
+            let delta_y = -(-fxy * gx + fxx * gy) / det;
+            if delta_x.abs() < PIXEL_MOVE_THRESHOLD && delta_y.abs() < PIXEL_MOVE_THRESHOLD {
+                x += delta_x;
+                y += delta_y;
+                break;
+            }
+            x += delta_x;
+            y += delta_y;
+        }
+
+        // Check if final position is within bounds.
+        if x < 1.0 || y < 1.0 || x > width - 3.0 || y > height - 3.0 {
             continue;
         }
 
-        // patch
-        let patch_size: usize = 4 * half_size_patch as usize + 1;
-        let patch = image_input.view(
-            (round_x - half_size_patch2) as u32,
-            (round_y - half_size_patch2) as u32,
-            (patch_size) as u32,
-            (patch_size) as u32,
-        );
-
-        let mut smooth_sub_image: faer::Mat<f32> = faer::Mat::zeros(kernel_size, kernel_size);
-        for r in 0..kernel_size {
-            for c in 0..kernel_size {
-                let sub_patch_vec: Vec<f32> = patch
-                    .view(c as u32, r as u32, kernel_size as u32, kernel_size as u32)
-                    .pixels()
-                    .map(|(_, _, v)| v.0[0].into())
-                    .collect();
-                let conv_p = sub_patch_vec
-                    .iter()
-                    .zip(&flat_k)
-                    .fold(0.0_f32, |acc, (k, p)| acc + k * p);
-                smooth_sub_image[(r, c)] = conv_p;
-            }
-        }
-
-        // a_1*x^2 + a_2*x*y + a_3*y^2 + a_4*x + a_5*y + a_6 = f
-        let mut mat_a: faer::Mat<f32> = faer::Mat::ones(kernel_size * kernel_size, 6);
-        let mut mat_b: faer::Mat<f32> = faer::Mat::zeros(kernel_size * kernel_size, 1);
-        let mut count = 0;
-        for r in 0..kernel_size {
-            for c in 0..kernel_size {
-                let x = c as f32 - half_size_patch as f32;
-                let y = r as f32 - half_size_patch as f32;
-                let f = smooth_sub_image[(r, c)];
-                mat_a[(count, 0)] = x * x;
-                mat_a[(count, 1)] = x * y;
-                mat_a[(count, 2)] = y * y;
-                mat_a[(count, 3)] = x;
-                mat_a[(count, 4)] = y;
-                mat_b[(count, 0)] = f;
-                count += 1;
-            }
-        }
-        let params = mat_a.qr().solve_lstsq(mat_b);
-
-        let a1 = params[(0, 0)];
-        let a2 = params[(1, 0)];
-        let a3 = params[(2, 0)];
-        let a4 = params[(3, 0)];
-        let a5 = params[(4, 0)];
-        // let a6 = params[(5, 0)];
-        let fxx = 2.0 * a1;
-        let fyy = 2.0 * a3;
-        let fxy = a2;
-        let d = fxx * fyy - fxy * fxy;
-
-        // is saddle point
-        if d < 0.0 {
-            let (x0, y0) = math_util::find_xy(2.0 * a1, a2, a4, a2, 2.0 * a3, a5);
-            // move too much
-            if x0.abs() > PIXEL_MOVE_THRESHOLD || y0.abs() > PIXEL_MOVE_THRESHOLD {
-                continue;
-            } else {
-                // Alturki, Abdulrahman S., and John S. Loomis.
-                // "A new X-Corner Detection for Camera Calibration Using Saddle Points."
-                let c5 = (a1 + a3) / 2.0;
-                let c4 = (a1 - a3) / 2.0;
-                let c3 = a2 / 2.0;
-                let k = (c4 * c4 + c3 * c3).sqrt();
-                let phi = (-1.0 * c5 / k).acos() / 2.0 / PI * 180.0;
-
-                let theta = c3.atan2(c4) / 2.0 / PI * 180.0;
-
-                if c5.abs() >= k {
-                    continue;
-                }
-                refined_corners.push(Saddle {
-                    p: (initial_x.round() + x0, initial_y.round() + y0),
-                    k,
-                    theta,
-                    phi,
-                });
-            }
-        } else {
+        // Recompute Hessian at the refined position.
+        let (_gx, _gy, fxx, fyy, fxy) = compute_gradient_hessian(image_input, x, y);
+        if fxx * fyy - fxy * fxy >= 0.0 {
             continue;
         }
+
+        // Compute quadratic parameters for saddle characterization.
+        let a1 = fxx / 2.0;
+        let a2 = fxy;
+        let a3 = fyy / 2.0;
+        let c5 = (a1 + a3) / 2.0;
+        let c4 = (a1 - a3) / 2.0;
+        let c3 = a2 / 2.0;
+        let k = (c4 * c4 + c3 * c3).sqrt();
+        if k.abs() < 1e-12 || c5.abs() >= k {
+            continue;
+        }
+        let phi = (-c5 / k).acos() / 2.0 / PI * 180.0;
+        let theta = c3.atan2(c4) / 2.0 / PI * 180.0;
+
+        refined_corners.push(Saddle {
+            p: (x, y),
+            k,
+            theta,
+            phi,
+        });
     }
     refined_corners
 }
@@ -385,7 +429,7 @@ impl TagDetector {
                 (sx / c.len() as f32, sy / c.len() as f32)
             })
             .collect();
-        let saddle_points = rochade_refine(&blur, &saddle_cluster_centers, 2);
+        let saddle_points = rochade_refine(&blur, &saddle_cluster_centers);
         let smax = saddle_points.iter().fold(f32::MIN, |acc, s| acc.max(s.k)) / 10.0;
         let refined: Vec<Saddle> = saddle_points
             .iter()
